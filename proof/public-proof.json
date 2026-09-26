@@ -1,0 +1,60 @@
+{
+  "badge_design_source": "IamAngusU/Badges",
+  "badge_design_source_commit": "4b262f6afbbbc2bc1b22370ae2cde547c19fd9d8",
+  "claim": "separate-account CI mirror; same maintainer; not a third-party audit",
+  "event": "push",
+  "head_sha": "a126b0c4ba60ee38ce04b282c3294af2ead4f6e1",
+  "jobs": [
+    {
+      "conclusion": "success",
+      "name": "Installers",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Native macOS 26 arm64 lifecycle",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Reference client contracts",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Go windows-latest",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Dependency and static security gates",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Go macos-latest",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Race detector",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Reproducible release and SBOM",
+      "status": "completed"
+    },
+    {
+      "conclusion": "success",
+      "name": "Go ubuntu-latest",
+      "status": "completed"
+    }
+  ],
+  "jobs_success": 9,
+  "jobs_total": 9,
+  "repository": "angusu-de/ContextBridge",
+  "run_id": 36245894427,
+  "run_number": 43,
+  "run_url": "https://github.com/angusu-de/ContextBridge/actions/runs/36245894427"
+}
