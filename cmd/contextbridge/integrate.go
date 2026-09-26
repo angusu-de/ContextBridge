@@ -586,10 +586,9 @@ func writeLiteLLMIntegrationFiles(configPath, envPath string, info liteLLMIntegr
 			_ = envFile.Close()
 		}
 		if !committed {
-			// #nosec G703 -- cleanup removes only the exact O_EXCL files created by this invocation.
-			_ = os.Remove(configPath)
+			_ = os.Remove(configPath) // #nosec G703 -- exact O_EXCL file created by this invocation.
 			if envCreated {
-				_ = os.Remove(envPath)
+				_ = os.Remove(envPath) // #nosec G703 -- exact O_EXCL file created by this invocation.
 			}
 		}
 	}()
