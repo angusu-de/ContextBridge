@@ -42,3 +42,21 @@ have performed the work.
 - ContextBridge verifies output contracts, artifact bytes, and digests.
 - Adapters provide bounded endpoint capability and completion evidence; the
   core does not embed adapter-specific logic.
+
+## Optional surrounding layers
+
+ContextBridge does not require a separate API gateway, model router, UI or MCP
+host. Those components may be placed around CB when they already solve a useful
+operator problem; they do not replace CB's authority model.
+
+```text
+direct:    application -> ContextBridge -> execution resource
+layered:   application -> optional gateway -> ContextBridge -> execution resource
+native:    orchestrator -> CB job contract -> authoritative lifecycle and evidence
+```
+
+For a layered request, CB owns only the part it receives: validation, admission,
+placement, execution verification and state beneath its ingress. An upstream
+gateway remains responsible for its own authentication, routing, retries,
+budgets and calls that never enter CB. Imported or reported observations must
+not be presented as authoritative CB execution evidence.

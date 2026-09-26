@@ -124,6 +124,55 @@ without a false `[DONE]`. Requiring `final-result` always keeps the buffered
 mode. Fallback, JSON, vision, adapters, cluster transport and E2EE remain
 truthfully final-result-only in this first slice.
 
+## Optional LiteLLM gateway
+
+ContextBridge already provides its own authenticated OpenAI-compatible input;
+LiteLLM is **not required**. Use this layering only when an existing LiteLLM
+deployment should expose a ContextBridge route beside its other models:
+
+```text
+application -> LiteLLM -> ContextBridge -> policy, pool and selected engine
+```
+
+Generate a secret-free LiteLLM configuration and a separate private
+environment file without printing the ContextBridge token:
+
+```sh
+contextbridge integrate litellm \
+  --write-config ./litellm-contextbridge.yaml \
+  --write-env ./.contextbridge-litellm.env
+```
+
+Both paths must be new and different. The command refuses to overwrite either
+file and removes its newly created counterpart if the command reports that the
+two-file operation failed. The YAML refers to `os.environ/CONTEXTBRIDGE_LITELLM_BASE_URL`
+and `os.environ/CONTEXTBRIDGE_LITELLM_API_KEY`; only the mode-`0600`
+environment file contains the local credential. The generated LiteLLM model
+alias is `contextbridge`.
+
+This first integration targets a native LiteLLM process on the same machine as
+the loopback-only ContextBridge service. A container's `127.0.0.1` is the
+container itself, not the host. Do not expose the local CB listener merely to
+make a container reach it; use an explicitly secured and authenticated network
+deployment when the gateway runs elsewhere.
+
+Authority remains compositional:
+
+- ContextBridge is authoritative only for requests that LiteLLM actually
+  forwards into CB.
+- LiteLLM-only routing, retries, budgets and provider calls are outside CB's
+  execution evidence.
+- `route explain` is an advisory preview. A native CB reservation/submission is
+  the authoritative scheduling decision.
+- The OpenAI-compatible boundary cannot carry every native CB feature. Durable
+  job lifecycle, artifact evidence, E2EE reservations and exact receipts use
+  the native contract instead.
+
+See the copy-paste startup and smoke-test commands in
+[examples/litellm](../examples/litellm/README.md). LiteLLM's official
+documentation describes its [`model_list` configuration](https://docs.litellm.ai/docs/proxy/configs)
+and [custom OpenAI-compatible endpoints](https://docs.litellm.ai/docs/providers/openai_compatible).
+
 ## Model capability passports
 
 ContextBridge keeps two kinds of evidence separate:

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,17 @@ type openAIIntegrationInfo struct {
 	TokenConfigured bool   `json:"token_configured"`
 	APIKey          string `json:"api_key,omitempty"`
 	ConfigPath      string `json:"config_path"`
+}
+
+type liteLLMIntegrationInfo struct {
+	Kind             string `json:"kind"`
+	ModelName        string `json:"model_name"`
+	DownstreamModel  string `json:"downstream_model"`
+	BaseURL          string `json:"base_url"`
+	TokenConfigured  bool   `json:"token_configured"`
+	ConfigPath       string `json:"contextbridge_config_path"`
+	OutputConfigPath string `json:"output_config_path,omitempty"`
+	OutputEnvPath    string `json:"output_env_path,omitempty"`
 }
 
 type mcpIntegrationInfo struct {
@@ -62,7 +74,7 @@ const (
 
 func integrateCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: contextbridge integrate openai|mcp|relay|ui [--config path] [--json]")
+		return errors.New("usage: contextbridge integrate openai|litellm|mcp|relay|ui [--config path] [--json]")
 	}
 	target := strings.ToLower(strings.TrimSpace(args[0]))
 	flags := flag.NewFlagSet("integrate "+target, flag.ContinueOnError)
@@ -70,6 +82,7 @@ func integrateCommand(args []string) error {
 	jsonOutput := flags.Bool("json", false, "print machine-readable JSON")
 	showToken := flags.Bool("show-token", false, "include the local API token in terminal output")
 	writeEnv := flags.String("write-env", "", "write a new mode-0600 OpenAI-compatible .env file")
+	writeConfig := flags.String("write-config", "", "write a new secret-free integration configuration file")
 	check := flags.Bool("check", false, "verify reachability, authentication, and the configured model without inference")
 	live := flags.Bool("live", false, "also send one explicit bounded live inference smoke request")
 	subject := flags.String("subject", "", "remote application identity (relay integration)")
@@ -89,6 +102,9 @@ func integrateCommand(args []string) error {
 	}
 	if target == "openai" && *jsonOutput && strings.TrimSpace(*writeEnv) != "" {
 		return errors.New("--json and --write-env are separate output modes")
+	}
+	if target != "litellm" && strings.TrimSpace(*writeConfig) != "" {
+		return errors.New("--write-config is available only for the litellm integration")
 	}
 	if *showToken && strings.TrimSpace(*writeEnv) != "" {
 		return errors.New("--show-token is unnecessary with --write-env and cannot be combined with it")
@@ -162,6 +178,67 @@ func integrateCommand(args []string) error {
 		fmt.Println("Create a private copy-paste .env file:")
 		fmt.Println("  contextbridge integrate openai --write-env .contextbridge.env")
 		fmt.Println("Use --show-token only when you intentionally need the key in terminal output.")
+		return nil
+	case "litellm":
+		if err := rejectUnexpectedIntegrationFlags(flags, map[string]bool{
+			"config": true, "json": true, "write-config": true, "write-env": true,
+		}); err != nil {
+			return err
+		}
+		if *showToken || *check || *live {
+			return errors.New("--show-token, --check, and --live are not available for LiteLLM integration; use 'integrate openai --check' to verify the downstream ContextBridge endpoint")
+		}
+		configTarget := strings.TrimSpace(*writeConfig)
+		envTarget := strings.TrimSpace(*writeEnv)
+		if (configTarget == "") != (envTarget == "") {
+			return errors.New("--write-config and --write-env must be provided together so the LiteLLM config stays secret-free")
+		}
+		openAIInfo, err := buildOpenAIIntegration(cfg, absoluteConfig, false)
+		if err != nil {
+			return err
+		}
+		info, err := buildLiteLLMIntegration(openAIInfo)
+		if err != nil {
+			return err
+		}
+		if configTarget != "" {
+			configOutput, err := filepath.Abs(configTarget)
+			if err != nil {
+				return err
+			}
+			envOutput, err := filepath.Abs(envTarget)
+			if err != nil {
+				return err
+			}
+			if err := writeLiteLLMIntegrationFiles(configOutput, envOutput, info, cfg.Server.Token); err != nil {
+				return err
+			}
+			info.OutputConfigPath = configOutput
+			info.OutputEnvPath = envOutput
+			if *jsonOutput {
+				return writeIntegrationJSON(info)
+			}
+			fmt.Printf("Created secret-free LiteLLM config %s\n", configOutput)
+			fmt.Printf("Created private LiteLLM environment file %s\n", envOutput)
+			fmt.Println("Load the environment file only into LiteLLM; ContextBridge remains usable directly without LiteLLM.")
+			return nil
+		}
+		if *jsonOutput {
+			return writeIntegrationJSON(info)
+		}
+		fmt.Println("Optional LiteLLM gateway in front of ContextBridge")
+		fmt.Printf("LiteLLM model    %s\n", info.ModelName)
+		fmt.Printf("CB model         %s\n", info.DownstreamModel)
+		fmt.Printf("CB base URL      %s\n", info.BaseURL)
+		if info.TokenConfigured {
+			fmt.Println("Token            configured · hidden")
+		} else {
+			fmt.Println("Token            not configured")
+		}
+		fmt.Println()
+		fmt.Println("Create a secret-free LiteLLM config and a separate private environment file:")
+		fmt.Println("  contextbridge integrate litellm --write-config ./litellm-contextbridge.yaml --write-env ./.contextbridge-litellm.env")
+		fmt.Println("LiteLLM is optional; applications may continue to connect to ContextBridge directly.")
 		return nil
 	case "mcp":
 		if *showToken || strings.TrimSpace(*writeEnv) != "" {
@@ -244,7 +321,7 @@ func integrateCommand(args []string) error {
 		fmt.Println("Keep the token in a trusted backend, desktop secret store, or private environment; never ship it in browser JavaScript.")
 		return nil
 	default:
-		return fmt.Errorf("unsupported integration %q; use openai, mcp, relay, or ui", target)
+		return fmt.Errorf("unsupported integration %q; use openai, litellm, mcp, relay, or ui", target)
 	}
 }
 
@@ -318,6 +395,20 @@ func splitIntegrationList(value string) []string {
 		}
 	}
 	return result
+}
+
+func rejectUnexpectedIntegrationFlags(flags *flag.FlagSet, allowed map[string]bool) error {
+	unexpected := make([]string, 0)
+	flags.Visit(func(option *flag.Flag) {
+		if !allowed[option.Name] {
+			unexpected = append(unexpected, "--"+option.Name)
+		}
+	})
+	if len(unexpected) == 0 {
+		return nil
+	}
+	sort.Strings(unexpected)
+	return fmt.Errorf("unsupported option(s) for %s: %s", flags.Name(), strings.Join(unexpected, ", "))
 }
 
 func checkOpenAIIntegration(ctx context.Context, client *http.Client, info openAIIntegrationInfo, token string, live bool) (openAIIntegrationCheck, error) {
@@ -439,6 +530,94 @@ func buildOpenAIIntegration(cfg config.Config, configPath string, showToken bool
 		info.APIKey = cfg.Server.Token
 	}
 	return info, nil
+}
+
+func buildLiteLLMIntegration(openAI openAIIntegrationInfo) (liteLLMIntegrationInfo, error) {
+	for _, value := range []string{openAI.BaseURL, openAI.Model, openAI.ConfigPath} {
+		if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\r\n\x00") {
+			return liteLLMIntegrationInfo{}, errors.New("ContextBridge integration value is empty or unsafe for LiteLLM configuration")
+		}
+	}
+	return liteLLMIntegrationInfo{
+		Kind:            "litellm-optional-gateway",
+		ModelName:       "contextbridge",
+		DownstreamModel: "openai/" + openAI.Model,
+		BaseURL:         openAI.BaseURL,
+		TokenConfigured: openAI.TokenConfigured,
+		ConfigPath:      openAI.ConfigPath,
+	}, nil
+}
+
+func renderLiteLLMIntegrationConfig(info liteLLMIntegrationInfo) (string, error) {
+	for _, value := range []string{info.ModelName, info.DownstreamModel} {
+		if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\r\n\x00") {
+			return "", errors.New("LiteLLM integration value is empty or unsafe")
+		}
+	}
+	return fmt.Sprintf("model_list:\n  - model_name: %s\n    litellm_params:\n      model: %s\n      api_base: os.environ/CONTEXTBRIDGE_LITELLM_BASE_URL\n      api_key: os.environ/CONTEXTBRIDGE_LITELLM_API_KEY\n", strconv.Quote(info.ModelName), strconv.Quote(info.DownstreamModel)), nil
+}
+
+func writeLiteLLMIntegrationFiles(configPath, envPath string, info liteLLMIntegrationInfo, token string) error {
+	if samePath(configPath, envPath) {
+		return errors.New("LiteLLM config and private environment paths must be different")
+	}
+	for _, value := range []string{info.BaseURL, token} {
+		if strings.TrimSpace(value) == "" || strings.ContainsAny(value, "\r\n\x00") {
+			return errors.New("LiteLLM environment value is empty or unsafe")
+		}
+	}
+	configContent, err := renderLiteLLMIntegrationConfig(info)
+	if err != nil {
+		return err
+	}
+	envContent := fmt.Sprintf("CONTEXTBRIDGE_LITELLM_BASE_URL=%s\nCONTEXTBRIDGE_LITELLM_API_KEY=%s\n", info.BaseURL, token)
+
+	// #nosec G703 -- both paths are explicit operator-selected outputs; O_EXCL prevents replacing existing data.
+	configFile, err := os.OpenFile(configPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return fmt.Errorf("create LiteLLM config without overwriting existing data: %w", err)
+	}
+	committed := false
+	var envFile *os.File
+	envCreated := false
+	defer func() {
+		_ = configFile.Close()
+		if envFile != nil {
+			_ = envFile.Close()
+		}
+		if !committed {
+			_ = os.Remove(configPath) // #nosec G703 -- exact O_EXCL file created by this invocation.
+			if envCreated {
+				_ = os.Remove(envPath) // #nosec G703 -- exact O_EXCL file created by this invocation.
+			}
+		}
+	}()
+	// #nosec G703 -- both paths are explicit operator-selected outputs; O_EXCL prevents replacing existing data.
+	envFile, err = os.OpenFile(envPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create private LiteLLM environment file without overwriting existing data: %w", err)
+	}
+	envCreated = true
+	if _, err := configFile.WriteString(configContent); err != nil {
+		return fmt.Errorf("write LiteLLM config: %w", err)
+	}
+	if err := configFile.Sync(); err != nil {
+		return fmt.Errorf("sync LiteLLM config: %w", err)
+	}
+	if _, err := envFile.WriteString(envContent); err != nil {
+		return fmt.Errorf("write private LiteLLM environment file: %w", err)
+	}
+	if err := envFile.Sync(); err != nil {
+		return fmt.Errorf("sync private LiteLLM environment file: %w", err)
+	}
+	if err := configFile.Close(); err != nil {
+		return fmt.Errorf("close LiteLLM config: %w", err)
+	}
+	if err := envFile.Close(); err != nil {
+		return fmt.Errorf("close private LiteLLM environment file: %w", err)
+	}
+	committed = true
+	return nil
 }
 
 func buildMCPIntegration(configPath string) (mcpIntegrationInfo, error) {

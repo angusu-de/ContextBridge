@@ -16,7 +16,7 @@ var completionSubcommands = map[string][]string{
 	"schedule":     {"add", "list", "show", "pause", "resume", "run", "delete"},
 	"runtime":      {"install"},
 	"mcp":          {"serve"},
-	"integrate":    {"openai", "mcp", "relay", "ui"},
+	"integrate":    {"openai", "litellm", "mcp", "relay", "ui"},
 	"verification": {"verify"},
 	"cluster":      {"status", "events", "estimate", "node", "protocol", "conformance", "submit", "chat", "agent", "selftest", "route", "contract", "receipt", "login", "token", "pairing", "configure", "dashboard", "pipeline", "lan"},
 	"route":        {"explain"},
@@ -56,7 +56,7 @@ $script:ContextBridgeSubcommands = @{
     schedule = @('add','list','show','pause','resume','run','delete')
     runtime = @('install')
     mcp = @('serve')
-    integrate = @('openai','mcp','relay','ui')
+    integrate = @('openai','litellm','mcp','relay','ui')
     verification = @('verify')
 	cluster = @('status','events','estimate','node','protocol','conformance','submit','chat','agent','selftest','route','contract','receipt','login','token','pairing','configure','dashboard','pipeline','lan')
     route = @('explain')
@@ -86,6 +86,7 @@ $script:ContextBridgeOptions = @{
     'runtime install' = @('--config')
     'mcp serve' = @('--config')
     'integrate openai' = @('--config','--json','--show-token','--write-env','--check','--live')
+    'integrate litellm' = @('--config','--json','--write-config','--write-env')
     'integrate mcp' = @('--config','--json')
     'integrate relay' = @('--config','--json','--write-env','--subject','--groups','--lifetime-hours','--max-queued-jobs','--max-jobs-per-hour','--providers','--allowed-tenants','--egress','--require-e2ee')
     'integrate ui' = @('--config','--json','--write-env','--subject','--lifetime-hours')
@@ -133,7 +134,7 @@ $script:ContextBridgeValueOptions = @{
     '--role' = @('admin','producer','node','observer')
 }
 $script:ContextBridgeTakesValue = @(
-	'--config','--install-dir','--file','--job','--artifacts','--artifact','--attach-image','--identity','--job-dir','--token-file','--trust-key','--evidence-dir','--write-env','--bundle','--advertise-host','--certificate-out',
+	'--config','--install-dir','--file','--job','--artifacts','--artifact','--attach-image','--identity','--job-dir','--token-file','--trust-key','--evidence-dir','--write-env','--write-config','--bundle','--advertise-host','--certificate-out',
     '--slots','--endpoint','--relay','--name','--providers','--models','--tasks','--groups',
     '--token','--provider','--group','--model','--profile','--reasoning','--session','--prompt',
 	'--min-artifacts','--min-images','--local-model','--image-profile','--timeout','--job-timeout','--poll','--after','--limit','--offset','--idempotency-key','--subject','--groups','--allowed-tenants','--lifetime-hours',
@@ -217,7 +218,7 @@ _contextbridge_complete() {
   fi
 
   case "$previous" in
-    --config|--file|--artifacts|--artifact|--attach-image|--identity|--job-dir|--token-file|--binary|--trust-key|--evidence-dir|--write-env|--certificate-out|--out|--bundle)
+    --config|--file|--artifacts|--artifact|--attach-image|--identity|--job-dir|--token-file|--binary|--trust-key|--evidence-dir|--write-env|--write-config|--certificate-out|--out|--bundle)
       if declare -F _filedir >/dev/null 2>&1; then _filedir; else COMPREPLY=( $(compgen -f -- "$current") ); fi
       return ;;
     --provider) candidates="adapter ollama nuextract jina" ;;
@@ -265,6 +266,7 @@ _contextbridge_complete() {
 	  "cluster lan status") candidates="--config" ;;
       "mcp serve") candidates="--config" ;;
       "integrate openai") candidates="--config --json --show-token --write-env --check --live" ;;
+      "integrate litellm") candidates="--config --json --write-config --write-env" ;;
       "integrate mcp") candidates="--config --json" ;;
       "integrate relay") candidates="--config --json --write-env --subject --groups --lifetime-hours --max-queued-jobs --max-jobs-per-hour --providers --allowed-tenants --egress --require-e2ee" ;;
       "integrate ui") candidates="--config --json --write-env --subject --lifetime-hours" ;;
@@ -307,7 +309,7 @@ _contextbridge_complete() {
       schedule) candidates="add list show pause resume run delete" ;;
       runtime) candidates="install" ;;
       mcp) candidates="serve" ;;
-      integrate) candidates="openai mcp relay ui" ;;
+      integrate) candidates="openai litellm mcp relay ui" ;;
       verification) candidates="verify" ;;
 	  cluster) candidates="status events estimate node protocol conformance submit chat agent selftest route contract receipt login token pairing configure dashboard pipeline lan" ;;
       route) candidates="explain" ;;
@@ -393,11 +395,12 @@ case "$words[2]" in
     ;;
   integrate)
     if (( CURRENT == 3 )); then
-	  _values 'integration target' openai mcp relay ui
+	  _values 'integration target' openai litellm mcp relay ui
       return
     fi
     case "$words[3]" in
       openai) _arguments "${config[@]}" '--json[Print redacted machine-readable connection settings]' '--show-token[Explicitly include the local API token in terminal output]' '--write-env[Create a new private environment file without overwriting]:environment file:_files' '--check[Verify service, authentication and route without inference]' '--live[Also send one explicit bounded live inference smoke request]' ;;
+      litellm) _arguments "${config[@]}" '--json[Print redacted machine-readable integration settings]' '--write-config[Create a new secret-free LiteLLM configuration]:configuration file:_files' '--write-env[Create a new private LiteLLM environment file]:environment file:_files' ;;
       mcp) _arguments "${config[@]}" '--json[Print the MCP client configuration as JSON]' ;;
       relay) _arguments "${config[@]}" '--json[Print redacted credential metadata]' '--write-env[Create a new private producer environment file]:environment file:_files' '--subject[Remote application identity]:identity:' '--groups[Comma-separated scheduling groups]:groups:' '--lifetime-hours[Credential lifetime; 0 never expires]:hours:' '--max-queued-jobs[Producer queued-job limit]:count:' '--max-jobs-per-hour[Durable hourly admission limit]:count:' '--providers[Comma-separated provider allowlist]:providers:' '--allowed-tenants[Comma-separated authenticated tenant_id allowlist]:tenants:' '--egress[Producer egress ceiling]:egress:(local_only)' '--require-e2ee[Reject cleartext jobs for this producer]' ;;
       ui) _arguments "${config[@]}" '--json[Print redacted credential metadata]' '--write-env[Create a new private observer environment file]:environment file:_files' '--subject[Read-only UI identity]:identity:' '--lifetime-hours[Credential lifetime; 0 never expires]:hours:' ;;

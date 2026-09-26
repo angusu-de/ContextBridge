@@ -14,6 +14,7 @@ import (
 
 	"github.com/IamAngusU/ContextBridge/internal/cluster"
 	"github.com/IamAngusU/ContextBridge/internal/config"
+	"gopkg.in/yaml.v3"
 )
 
 type integrationRoundTripper func(*http.Request) (*http.Response, error)
@@ -351,6 +352,204 @@ func TestOpenAIIntegrationRejectsUnsafeEnvValues(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("unsafe integration created a file: %v", err)
+	}
+}
+
+func TestLiteLLMIntegrationWritesSecretFreeConfigAndPrivateEnv(t *testing.T) {
+	openAI := openAIIntegrationInfo{
+		Kind:            "openai-compatible",
+		BaseURL:         "http://127.0.0.1:32145/openai/v1",
+		Model:           "contextbridge:default",
+		TokenConfigured: true,
+		ConfigPath:      filepath.Join(t.TempDir(), "config.yml"),
+	}
+	info, err := buildLiteLLMIntegration(openAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.ModelName != "contextbridge" || info.DownstreamModel != "openai/contextbridge:default" || info.BaseURL != openAI.BaseURL {
+		t.Fatalf("unexpected LiteLLM integration: %#v", info)
+	}
+
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "litellm-contextbridge.yaml")
+	envPath := filepath.Join(directory, ".contextbridge-litellm.env")
+	const token = "private-litellm-token"
+	if err := writeLiteLLMIntegrationFiles(configPath, envPath, info, token); err != nil {
+		t.Fatal(err)
+	}
+	configRaw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configContent := string(configRaw)
+	for _, expected := range []string{
+		`model_name: "contextbridge"`,
+		`model: "openai/contextbridge:default"`,
+		"api_base: os.environ/CONTEXTBRIDGE_LITELLM_BASE_URL",
+		"api_key: os.environ/CONTEXTBRIDGE_LITELLM_API_KEY",
+	} {
+		if !strings.Contains(configContent, expected) {
+			t.Fatalf("LiteLLM config is missing %q:\n%s", expected, configContent)
+		}
+	}
+	if strings.Contains(configContent, token) || strings.Contains(configContent, openAI.BaseURL) {
+		t.Fatal("secret-free LiteLLM config contains private environment data")
+	}
+	var parsed struct {
+		ModelList []struct {
+			ModelName string `yaml:"model_name"`
+			Params    struct {
+				Model   string `yaml:"model"`
+				BaseURL string `yaml:"api_base"`
+				APIKey  string `yaml:"api_key"`
+			} `yaml:"litellm_params"`
+		} `yaml:"model_list"`
+	}
+	if err := yaml.Unmarshal(configRaw, &parsed); err != nil {
+		t.Fatalf("generated LiteLLM YAML is invalid: %v", err)
+	}
+	if len(parsed.ModelList) != 1 || parsed.ModelList[0].ModelName != "contextbridge" || parsed.ModelList[0].Params.Model != "openai/contextbridge:default" || parsed.ModelList[0].Params.BaseURL != "os.environ/CONTEXTBRIDGE_LITELLM_BASE_URL" || parsed.ModelList[0].Params.APIKey != "os.environ/CONTEXTBRIDGE_LITELLM_API_KEY" {
+		t.Fatalf("generated LiteLLM YAML has the wrong structure: %#v", parsed)
+	}
+	envRaw, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envContent := string(envRaw)
+	for _, expected := range []string{
+		"CONTEXTBRIDGE_LITELLM_BASE_URL=" + openAI.BaseURL,
+		"CONTEXTBRIDGE_LITELLM_API_KEY=" + token,
+	} {
+		if !strings.Contains(envContent, expected) {
+			t.Fatalf("private LiteLLM environment file is missing %q: %s", expected, envContent)
+		}
+	}
+}
+
+func TestLiteLLMIntegrationNeverOverwritesOrRemovesExistingFiles(t *testing.T) {
+	info := liteLLMIntegrationInfo{
+		ModelName:       "contextbridge",
+		DownstreamModel: "openai/contextbridge:default",
+		BaseURL:         "http://127.0.0.1:32145/openai/v1",
+	}
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "litellm.yaml")
+	envPath := filepath.Join(directory, "litellm.env")
+	if err := os.WriteFile(envPath, []byte("KEEP=ME\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLiteLLMIntegrationFiles(configPath, envPath, info, "secret"); err == nil {
+		t.Fatal("LiteLLM writer overwrote an existing environment file")
+	}
+	if raw, err := os.ReadFile(envPath); err != nil || string(raw) != "KEEP=ME\n" {
+		t.Fatalf("failed write changed or removed an existing environment file: %q %v", raw, err)
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("failed two-file write left a partial config: %v", err)
+	}
+
+	if err := os.WriteFile(configPath, []byte("keep: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeLiteLLMIntegrationFiles(configPath, filepath.Join(directory, "new.env"), info, "secret"); err == nil {
+		t.Fatal("LiteLLM writer overwrote an existing config")
+	}
+	if raw, err := os.ReadFile(configPath); err != nil || string(raw) != "keep: true\n" {
+		t.Fatalf("failed write changed an existing config: %q %v", raw, err)
+	}
+}
+
+func TestLiteLLMIntegrationRejectsUnsafeOrAliasedOutputs(t *testing.T) {
+	info := liteLLMIntegrationInfo{
+		ModelName:       "contextbridge",
+		DownstreamModel: "openai/contextbridge:default",
+		BaseURL:         "http://127.0.0.1:32145/openai/v1",
+	}
+	path := filepath.Join(t.TempDir(), "same-file")
+	if err := writeLiteLLMIntegrationFiles(path, path, info, "secret"); err == nil {
+		t.Fatal("LiteLLM writer accepted the same path for public config and private environment")
+	}
+	if err := writeLiteLLMIntegrationFiles(path+".yaml", path+".env", info, "secret\nINJECTED=yes"); err == nil {
+		t.Fatal("LiteLLM writer accepted a newline-bearing token")
+	}
+	if _, err := os.Stat(path + ".yaml"); !os.IsNotExist(err) {
+		t.Fatalf("unsafe values created a config file: %v", err)
+	}
+}
+
+func TestLiteLLMIntegrationCommandCreatesFilesWithoutPrintingToken(t *testing.T) {
+	directory := t.TempDir()
+	configPath := filepath.Join(directory, "config.yml")
+	if err := config.Default(configPath); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	yamlPath := filepath.Join(directory, "litellm.yaml")
+	envPath := filepath.Join(directory, ".litellm.env")
+	readEnd, writeEnd, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousStdout := os.Stdout
+	os.Stdout = writeEnd
+	commandErr := integrateCommand([]string{"litellm", "--config", configPath, "--write-config", yamlPath, "--write-env", envPath, "--json"})
+	_ = writeEnd.Close()
+	os.Stdout = previousStdout
+	stdout, _ := io.ReadAll(readEnd)
+	_ = readEnd.Close()
+	if commandErr != nil {
+		t.Fatal(commandErr)
+	}
+	if strings.Contains(string(stdout), cfg.Server.Token) {
+		t.Fatal("LiteLLM integration metadata printed the local credential")
+	}
+	var report liteLLMIntegrationInfo
+	if err := json.Unmarshal(stdout, &report); err != nil {
+		t.Fatalf("LiteLLM integration did not emit valid JSON metadata: %q: %v", stdout, err)
+	}
+	if report.OutputConfigPath != yamlPath || report.OutputEnvPath != envPath || report.ModelName != "contextbridge" {
+		t.Fatalf("unexpected LiteLLM command metadata: %#v", report)
+	}
+	private, err := os.ReadFile(envPath)
+	if err != nil || !strings.Contains(string(private), cfg.Server.Token) {
+		t.Fatalf("private LiteLLM environment did not contain the credential: %q %v", private, err)
+	}
+	public, err := os.ReadFile(yamlPath)
+	if err != nil || strings.Contains(string(public), cfg.Server.Token) {
+		t.Fatalf("secret-free LiteLLM config is missing or leaked the credential: %q %v", public, err)
+	}
+}
+
+func TestLiteLLMIntegrationCommandRequiresBothOutputPaths(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := config.Default(configPath); err != nil {
+		t.Fatal(err)
+	}
+	err := integrateCommand([]string{"litellm", "--config", configPath, "--write-config", filepath.Join(t.TempDir(), "litellm.yaml")})
+	if err == nil || !strings.Contains(err.Error(), "must be provided together") {
+		t.Fatalf("one-file LiteLLM command was not rejected clearly: %v", err)
+	}
+}
+
+func TestLiteLLMIntegrationCommandRejectsOptionsItCannotEnforce(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yml")
+	if err := config.Default(configPath); err != nil {
+		t.Fatal(err)
+	}
+	for _, option := range [][]string{
+		{"--subject", "mistaken-scoped-client"},
+		{"--providers", "ollama"},
+		{"--show-token"},
+	} {
+		args := append([]string{"litellm", "--config", configPath}, option...)
+		err := integrateCommand(args)
+		if err == nil || !strings.Contains(err.Error(), "unsupported option") {
+			t.Fatalf("LiteLLM integration silently accepted %v: %v", option, err)
+		}
 	}
 }
 

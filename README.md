@@ -180,6 +180,17 @@ Before opening the app, `contextbridge integrate openai --check` verifies the
 service, local credential and selected route without inference. Add `--live`
 only when you intentionally want one bounded real model request.
 
+Already use LiteLLM? Keep it. ContextBridge does not depend on it, but can
+generate a secret-free model entry plus a separate private environment file:
+
+```sh
+contextbridge integrate litellm --write-config ./litellm-contextbridge.yaml --write-env ./.contextbridge-litellm.env
+```
+
+This optional layering exposes CB as one LiteLLM model named `contextbridge`;
+direct CB clients continue to work unchanged. See the
+[LiteLLM example and authority boundaries](examples/litellm/README.md).
+
 Copy the emitted server entry into the client's MCP configuration. See
 [Application integrations](docs/integrations.md) for the native job API, PHP,
 shared hosting and security boundaries. A remote website uses its own scoped
@@ -606,6 +617,7 @@ For `route explain`, use a native cluster job such as [examples/cluster-job.json
 | Want to… | Command / guide |
 | --- | --- |
 | Connect an OpenAI-compatible app | `contextbridge integrate openai --write-env .contextbridge.env` · [Integrations](docs/integrations.md) |
+| Add CB to an existing LiteLLM gateway | `contextbridge integrate litellm --write-config ./litellm-contextbridge.yaml --write-env ./.contextbridge-litellm.env` · [Example](examples/litellm/README.md) |
 | Connect an MCP client | `contextbridge mcp serve` · [Integrations](docs/integrations.md) |
 | Build a custom dashboard or terminal UI | `contextbridge integrate ui --subject my-ui --write-env ./contextbridge-ui.env` · [UI data API](docs/integrations.md#read-only-ui-and-observability-clients) |
 | Inspect schedules | `contextbridge schedule list` · [Automation](docs/automation.md) |
