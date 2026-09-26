@@ -175,7 +175,7 @@ LOCAL RESOURCES AND INTEGRATIONS
   contextbridge hardware | models | resources Inspect usable local capacity
   contextbridge pull MODEL                    Download a configured model safely
   contextbridge runtime install llama.cpp     Install the supported local runtime
-  contextbridge integrate openai|mcp|relay|ui Print copy-ready integration settings
+  contextbridge integrate openai|litellm|mcp|relay|ui Print copy-ready integration settings
   contextbridge mcp serve                     Expose the bounded MCP surface
 
 OPERATE AND MAINTAIN
@@ -218,7 +218,7 @@ func writeCommandGroupHelp(out io.Writer, path []string) bool {
 	case "mcp":
 		help = "Usage: contextbridge mcp serve [--config PATH]\n"
 	case "integrate":
-		help = "Usage: contextbridge integrate openai|mcp|relay|ui [options]\n"
+		help = "Usage: contextbridge integrate openai|litellm|mcp|relay|ui [options]\n"
 	case "verification":
 		help = "Usage: contextbridge verification verify [options]\n"
 	case "update":
