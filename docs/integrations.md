@@ -173,6 +173,27 @@ See the copy-paste startup and smoke-test commands in
 documentation describes its [`model_list` configuration](https://docs.litellm.ai/docs/proxy/configs)
 and [custom OpenAI-compatible endpoints](https://docs.litellm.ai/docs/providers/openai_compatible).
 
+## External workflow engines
+
+An existing n8n, Temporal, CI, cron or application workflow can remain the
+orchestrator and submit bounded native ContextBridge jobs. Use one stable,
+producer-scoped `Idempotency-Key` for one logical action and preserve the exact
+request bytes across an ambiguous submit retry. Persist the accepted CB job ID
+and poll it; never turn a result poll into a new submission.
+
+The dependency-free Node.js reference client demonstrates:
+
+- one bounded repeat after a lost or malformed submit response, using the
+  exact same request bytes and operation ID;
+- no automatic retry after an HTTP response;
+- process-restart recovery with the same operation ID; and
+- rejection when different work reuses an existing operation ID.
+
+See [examples/external-workflow](../examples/external-workflow/README.md) for a
+copy-paste proof and n8n HTTP Request node mapping. ContextBridge owns admitted
+job policy, placement, lease state and finality. The external engine still owns
+triggers, branches, approvals, schedules and workflow-level retry policy.
+
 ## Model capability passports
 
 ContextBridge keeps two kinds of evidence separate:

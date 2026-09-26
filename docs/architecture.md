@@ -45,6 +45,13 @@ have performed the work.
 
 ## Optional surrounding layers
 
+**Connect, do not replace.** ContextBridge remains fully usable on its own.
+Existing gateways, runtimes, orchestrators, observability systems, storage
+systems and application layers may retain their responsibilities when that
+does not weaken the explicit CB execution contract. Authority is
+domain-specific: CB claims authority and evidence only for boundaries it
+actually controls.
+
 ContextBridge does not require a separate API gateway, model router, UI or MCP
 host. Those components may be placed around CB when they already solve a useful
 operator problem; they do not replace CB's authority model.
@@ -60,3 +67,13 @@ placement, execution verification and state beneath its ingress. An upstream
 gateway remains responsible for its own authentication, routing, retries,
 budgets and calls that never enter CB. Imported or reported observations must
 not be presented as authoritative CB execution evidence.
+
+| Boundary | Authoritative component |
+| --- | --- |
+| External workflow triggers, branches and approvals | external orchestrator |
+| External gateway-only routing, retries and budgets | external gateway |
+| Runtime installation, loading and shutdown | runtime manager, unless explicitly CB-managed |
+| Retained copies outside a CB receipt | external archive |
+| Admitted CB job policy and placement | ContextBridge relay |
+| CB lease, cancellation and terminal state | ContextBridge relay |
+| Verified CB result/artifact evidence | ContextBridge receipt and referenced bytes |

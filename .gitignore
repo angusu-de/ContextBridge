@@ -10,3 +10,4 @@
 .contextbridge-litellm.env
 contextbridge-producer.env
 *.log
+__pycache__/

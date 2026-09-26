@@ -618,6 +618,7 @@ For `route explain`, use a native cluster job such as [examples/cluster-job.json
 | --- | --- |
 | Connect an OpenAI-compatible app | `contextbridge integrate openai --write-env .contextbridge.env` · [Integrations](docs/integrations.md) |
 | Add CB to an existing LiteLLM gateway | `contextbridge integrate litellm --write-config ./litellm-contextbridge.yaml --write-env ./.contextbridge-litellm.env` · [Example](examples/litellm/README.md) |
+| Submit durable jobs from n8n or another workflow engine | Keep the workflow external and use a stable operation ID · [Example](examples/external-workflow/README.md) |
 | Connect an MCP client | `contextbridge mcp serve` · [Integrations](docs/integrations.md) |
 | Build a custom dashboard or terminal UI | `contextbridge integrate ui --subject my-ui --write-env ./contextbridge-ui.env` · [UI data API](docs/integrations.md#read-only-ui-and-observability-clients) |
 | Inspect schedules | `contextbridge schedule list` · [Automation](docs/automation.md) |
