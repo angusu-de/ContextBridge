@@ -85,35 +85,37 @@ const (
 )
 
 type Relay struct {
-	cfg              RelayConfig
-	startedAt        time.Time
-	store            *Store
-	authority        RelayAuthority
-	logger           *log.Logger
-	mu               sync.RWMutex
-	workers          map[string]*workerConnection
-	rateMu           sync.Mutex
-	rate             map[string]*rateWindow
-	rateLastSweep    time.Time
-	workerRateMu     sync.Mutex
-	workerRate       map[string]*rateWindow
-	workerRateSweep  time.Time
-	wake             chan struct{}
-	maintenanceMu    sync.Mutex
-	nextMaintenance  time.Time
-	retentionMu      sync.Mutex
-	nextRetention    time.Time
-	fairnessMu       sync.Mutex
-	lastOwner        map[int]string
-	queueScanAfter   []byte
-	lifecycleMu      sync.RWMutex
-	lifecycleCtx     context.Context
-	pipelineWG       sync.WaitGroup
-	admissionMu      sync.RWMutex
-	quiescing        bool
-	eventStreamSlots chan struct{}
-	eventStreamMu    sync.Mutex
-	eventStreams     map[string]int
+	cfg               RelayConfig
+	startedAt         time.Time
+	store             *Store
+	authority         RelayAuthority
+	logger            *log.Logger
+	mu                sync.RWMutex
+	workers           map[string]*workerConnection
+	rateMu            sync.Mutex
+	rate              map[string]*rateWindow
+	rateLastSweep     time.Time
+	workerRateMu      sync.Mutex
+	workerRate        map[string]*rateWindow
+	workerRateSweep   time.Time
+	wake              chan struct{}
+	maintenanceMu     sync.Mutex
+	nextMaintenance   time.Time
+	retentionMu       sync.Mutex
+	nextRetention     time.Time
+	fairnessMu        sync.Mutex
+	lastOwner         map[int]string
+	queueScanAfter    []byte
+	lifecycleMu       sync.RWMutex
+	lifecycleCtx      context.Context
+	pipelineWG        sync.WaitGroup
+	admissionMu       sync.RWMutex
+	quiescing         bool
+	eventStreamSlots  chan struct{}
+	eventStreamMu     sync.Mutex
+	eventStreams      map[string]int
+	adapterPresenceMu sync.Mutex
+	adapterPresences  map[string]AdapterPresence
 }
 
 type heartbeatRateWindow struct {
@@ -452,7 +454,7 @@ func NewRelay(cfg RelayConfig, logger *log.Logger) (*Relay, error) {
 	if logger == nil {
 		logger = log.Default()
 	}
-	return &Relay{cfg: cfg, startedAt: now, store: store, authority: authority, logger: logger, workers: map[string]*workerConnection{}, rate: map[string]*rateWindow{}, workerRate: map[string]*rateWindow{}, wake: make(chan struct{}, 1), nextRetention: now.Add(cfg.RetentionSweep), lastOwner: map[int]string{}, eventStreamSlots: make(chan struct{}, maximumExecutionEventStreams), eventStreams: map[string]int{}}, nil
+	return &Relay{cfg: cfg, startedAt: now, store: store, authority: authority, logger: logger, workers: map[string]*workerConnection{}, rate: map[string]*rateWindow{}, workerRate: map[string]*rateWindow{}, wake: make(chan struct{}, 1), nextRetention: now.Add(cfg.RetentionSweep), lastOwner: map[int]string{}, eventStreamSlots: make(chan struct{}, maximumExecutionEventStreams), eventStreams: map[string]int{}, adapterPresences: map[string]AdapterPresence{}}, nil
 }
 
 func applyRetentionDefaults(cfg *RelayConfig) error {
@@ -528,6 +530,13 @@ func (r *Relay) Handler() http.Handler {
 	mux.HandleFunc("DELETE /v1/cluster/jobs/{id}", r.authorize("admin", "producer")(r.handleCancel))
 	mux.HandleFunc("POST /v1/cluster/assign", r.authorize("admin", "producer")(r.handleReserve))
 	mux.HandleFunc("POST /v1/cluster/routes/explain", r.authorize("admin", "producer")(r.handleRouteExplain))
+	// A producer may own up to 32 short-lease instances. Six hundred requests
+	// per client/minute covers their minimum five-second renewal cadence while
+	// the registry and per-owner limits still bound memory.
+	mux.HandleFunc("POST /v1/cluster/adapters/heartbeat", r.authorize("producer")(r.rateLimit(600, time.Minute, r.handleAdapterHeartbeat)))
+	mux.HandleFunc("GET /v1/cluster/adapters", r.authorize("admin", "observer", "producer")(r.handleAdapters))
+	mux.HandleFunc("GET /v1/cluster/adapters/{id}", r.authorize("admin", "observer", "producer")(r.handleAdapter))
+	mux.HandleFunc("POST /v1/cluster/adapters/{id}/{action}", r.authorize("admin")(r.handleAdapterControl))
 	mux.HandleFunc("GET /v1/cluster/workers/connect", r.authorize("node")(r.handleWorker))
 	mux.HandleFunc("GET /v1/cluster/tokens", r.authorize("admin")(r.handleTokens))
 	mux.HandleFunc("POST /v1/cluster/tokens", r.authorize("admin")(r.handleCreateToken))
@@ -548,9 +557,9 @@ func (r *Relay) handleProtocolManifest(w http.ResponseWriter, _ *http.Request) {
 func (r *Relay) handleWhoAmI(w http.ResponseWriter, req *http.Request) {
 	record, _ := tokenRecord(req.Context())
 	permissions := map[string][]string{
-		"admin":    {"cluster:admin", "cluster:read", "events:read", "jobs:read", "jobs:write", "tokens:manage"},
-		"observer": {"cluster:read", "jobs:read", "pipelines:read"},
-		"producer": {"cluster:read", "jobs:read-own", "jobs:write-own", "pipelines:read-own", "pipelines:write-own"},
+		"admin":    {"cluster:admin", "cluster:read", "events:read", "jobs:read", "jobs:write", "tokens:manage", "adapters:read", "adapters:control"},
+		"observer": {"cluster:read", "jobs:read", "pipelines:read", "adapters:read"},
+		"producer": {"cluster:read", "jobs:read-own", "jobs:write-own", "pipelines:read-own", "pipelines:write-own", "adapters:register-own", "adapters:read-own"},
 		"node":     {"worker:connect"},
 	}
 	if record.Role == "observer" && !observerIsScoped(record) {
@@ -877,10 +886,11 @@ func (r *Relay) handleJobs(w http.ResponseWriter, req *http.Request) {
 	}
 	record, _ := tokenRecord(req.Context())
 	owner := ""
+	allowedSubjects, allowedTenants := []string(nil), []string(nil)
 	if record.Role == "producer" {
 		owner = record.Subject
+		allowedTenants = record.ProducerLimits.AllowedTenants
 	}
-	allowedSubjects, allowedTenants := []string(nil), []string(nil)
 	if record.Role == "observer" {
 		allowedSubjects = record.ObserverLimits.AllowedSubjects
 		allowedTenants = record.ObserverLimits.AllowedTenants
@@ -1133,10 +1143,12 @@ func (r *Relay) handleCancel(w http.ResponseWriter, req *http.Request) {
 	}
 	record, _ := tokenRecord(req.Context())
 	owner := ""
+	allowedTenants := []string(nil)
 	if record.Role == "producer" {
 		owner = record.Subject
+		allowedTenants = record.ProducerLimits.AllowedTenants
 	}
-	job, err := r.store.CancelJobOwned(req.PathValue("id"), owner)
+	job, err := r.store.CancelJobForProducer(req.PathValue("id"), owner, allowedTenants)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			writeError(w, http.StatusNotFound, errors.New("job not found"))
@@ -2723,7 +2735,7 @@ func scopeTenantID(tenantID *string, record TokenRecord) error {
 func (r *Relay) visibleJob(ctx context.Context, id string) (Job, error) {
 	record, ok := tokenRecord(ctx)
 	if ok && record.Role == "producer" {
-		return r.store.GetJobForOwner(id, record.Subject)
+		return r.store.GetJobForProducer(id, record.Subject, record.ProducerLimits.AllowedTenants)
 	}
 	job, err := r.store.GetJob(id)
 	if err != nil || (ok && !recordCanObserve(record, job.OwnerSubject, job.TenantID)) {
@@ -2735,7 +2747,7 @@ func (r *Relay) visibleJob(ctx context.Context, id string) (Job, error) {
 func (r *Relay) visiblePipelineRun(ctx context.Context, id string) (PipelineRun, error) {
 	record, ok := tokenRecord(ctx)
 	if ok && record.Role == "producer" {
-		return r.store.GetPipelineRunForOwner(id, record.Subject)
+		return r.store.GetPipelineRunForProducer(id, record.Subject, record.ProducerLimits.AllowedTenants)
 	}
 	run, err := r.store.GetPipelineRun(id)
 	if err != nil || (ok && !recordCanObserve(record, run.OwnerSubject, run.TenantID)) {

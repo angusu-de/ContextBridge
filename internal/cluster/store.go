@@ -45,13 +45,14 @@ var (
 	bucketPipelineOwnerLookup = []byte("pipeline_owner_lookup_v1")
 	bucketSessionPlacements   = []byte("session_placements_v1")
 	bucketAdapterSessionLocks = []byte("adapter_session_locks_v1")
+	bucketAdapterControls     = []byte("adapter_controls_v1")
 	bucketJobIdempotency      = []byte("job_idempotency_v1")
 	bucketJobIdempotencyByJob = []byte("job_idempotency_by_job_v1")
 	bucketProducerRateWindows = []byte("producer_rate_windows_v1")
 	keyJobOwnerIndexVersion   = []byte("job_owner_index_version")
 	jobOwnerIndexVersion      = []byte("1")
 	keyOwnerLookupVersion     = []byte("execution_owner_lookup_version")
-	ownerLookupVersion        = []byte("1")
+	ownerLookupVersion        = []byte("2")
 	keyJobContractVersion     = []byte("job_contract_version")
 	jobContractVersion        = []byte("1")
 	keyQueueIndexVersion      = []byte("queue_index_version")
@@ -66,7 +67,7 @@ func requiredStoreBuckets() [][]byte {
 		bucketJobs, bucketJobIndex, bucketJobOwnerIndex, bucketJobOwnerLookup, bucketStoreMeta,
 		bucketQueue, bucketQueueJobIndex, bucketQueueCounts, bucketNodes, bucketTokens, bucketPairings, bucketPairCodes,
 		bucketAssignments, bucketEvents, bucketJobEvents, bucketPipelineEvents, bucketPipelineRuns, bucketPipelineOwnerLookup, bucketSessionPlacements,
-		bucketAdapterSessionLocks, bucketJobIdempotency, bucketJobIdempotencyByJob, bucketProducerRateWindows,
+		bucketAdapterSessionLocks, bucketAdapterControls, bucketJobIdempotency, bucketJobIdempotencyByJob, bucketProducerRateWindows,
 		bucketHistoricalTotals,
 	}
 }
@@ -193,6 +194,19 @@ type adapterSessionLock struct {
 	ExpiresAt time.Time `json:"expires_at,omitempty"`
 }
 
+// AdapterControl is durable operator intent for one external adapter identity.
+// Runtime presence is deliberately leased in memory; only the explicit
+// enabled/disabled decision survives a relay restart.
+type AdapterControl struct {
+	Schema       string    `json:"schema"`
+	AdapterUID   string    `json:"adapter_uid"`
+	Enabled      bool      `json:"enabled"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	ActorSubject string    `json:"actor_subject"`
+}
+
+const AdapterControlV1 = "contextbridge.adapter-control.v1"
+
 func OpenStore(path string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
@@ -243,6 +257,42 @@ func (s *Store) Ready() error {
 		}
 		return nil
 	})
+}
+
+// AdapterEnabled returns the durable desired state for an external adapter.
+// Absence means enabled so an independently deployed adapter can attach without
+// a prior privileged mutation.
+func (s *Store) AdapterEnabled(adapterUID string) (bool, error) {
+	if !validAdapterUID(adapterUID) {
+		return false, errors.New("adapter UID is invalid")
+	}
+	control := AdapterControl{}
+	err := s.db.View(func(tx *bolt.Tx) error {
+		return getJSON(tx.Bucket(bucketAdapterControls), adapterUID, &control)
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if control.Schema != AdapterControlV1 || control.AdapterUID != adapterUID || control.ActorSubject == "" || control.UpdatedAt.IsZero() {
+		return false, errors.New("adapter control record is invalid")
+	}
+	return control.Enabled, nil
+}
+
+// SetAdapterEnabled stores one explicit operator decision. The adapter still
+// needs a fresh valid lease before it can be reported as available.
+func (s *Store) SetAdapterEnabled(adapterUID string, enabled bool, actorSubject string, now time.Time) (AdapterControl, error) {
+	if !validAdapterUID(adapterUID) || !validRoutingLabel(actorSubject, 120) || now.IsZero() {
+		return AdapterControl{}, errors.New("adapter control request is invalid")
+	}
+	control := AdapterControl{Schema: AdapterControlV1, AdapterUID: adapterUID, Enabled: enabled, UpdatedAt: now.UTC(), ActorSubject: actorSubject}
+	err := s.db.Update(func(tx *bolt.Tx) error {
+		return putJSON(tx.Bucket(bucketAdapterControls), adapterUID, control)
+	})
+	return control, err
 }
 
 // AcquireRelayAuthority returns the stable identity of this durable store and
@@ -1326,7 +1376,7 @@ func (s *Store) admitPreparedJobTx(tx *bolt.Tx, job *Job, maxQueued int, limits 
 	if err := putJSON(tx.Bucket(bucketJobs), job.ID, *job); err != nil {
 		return false, err
 	}
-	if err := putOwnerLookup(tx.Bucket(bucketJobOwnerLookup), job.ID, job.OwnerSubject); err != nil {
+	if err := putExecutionScopeLookup(tx.Bucket(bucketJobOwnerLookup), job.ID, job.OwnerSubject, job.TenantID); err != nil {
 		return false, err
 	}
 	if err := tx.Bucket(bucketJobIndex).Put(jobIndexKey(*job), []byte(job.ID)); err != nil {
@@ -1897,7 +1947,7 @@ func (s *Store) consumeReservationAdmitted(id, secret, requestedJobID string, se
 		if err := putJSON(tx.Bucket(bucketJobs), job.ID, job); err != nil {
 			return err
 		}
-		if err := putOwnerLookup(tx.Bucket(bucketJobOwnerLookup), job.ID, job.OwnerSubject); err != nil {
+		if err := putExecutionScopeLookup(tx.Bucket(bucketJobOwnerLookup), job.ID, job.OwnerSubject, job.TenantID); err != nil {
 			return err
 		}
 		if err := tx.Bucket(bucketJobIndex).Put(jobIndexKey(job), []byte(job.ID)); err != nil {
@@ -2026,12 +2076,26 @@ func (s *Store) GetJob(id string) (Job, error) {
 // decoding the authoritative job record. Foreign and missing IDs therefore
 // avoid body-size-dependent JSON work and both fail closed as not found.
 func (s *Store) GetJobForOwner(id, owner string) (Job, error) {
+	return s.GetJobForProducer(id, owner, nil)
+}
+
+// GetJobForProducer authorizes both the authenticated producer subject and an
+// optional credential-bound tenant allowlist against fixed-size digests before
+// decoding the authoritative job record. Foreign and missing IDs therefore
+// remain indistinguishable and cannot trigger body-size-dependent JSON work.
+func (s *Store) GetJobForProducer(id, owner string, allowedTenants []string) (Job, error) {
 	var job Job
 	err := s.db.View(func(tx *bolt.Tx) error {
-		if !ownerLookupMatches(tx.Bucket(bucketJobOwnerLookup), id, owner) {
+		if !executionScopeLookupMatches(tx.Bucket(bucketJobOwnerLookup), id, owner, allowedTenants) {
 			return os.ErrNotExist
 		}
-		return getJSON(tx.Bucket(bucketJobs), id, &job)
+		if err := getJSON(tx.Bucket(bucketJobs), id, &job); err != nil {
+			return err
+		}
+		if job.OwnerSubject != owner || !tenantAllowed(job.TenantID, allowedTenants) {
+			return os.ErrNotExist
+		}
+		return nil
 	})
 	return job, err
 }
@@ -2377,7 +2441,7 @@ func (s *Store) SaveJob(job Job) error {
 		if err := putJSON(tx.Bucket(bucketJobs), job.ID, job); err != nil {
 			return err
 		}
-		if err := putOwnerLookup(tx.Bucket(bucketJobOwnerLookup), job.ID, job.OwnerSubject); err != nil {
+		if err := putExecutionScopeLookup(tx.Bucket(bucketJobOwnerLookup), job.ID, job.OwnerSubject, job.TenantID); err != nil {
 			return err
 		}
 		if previousExists && !bytes.Equal(jobIndexKey(previous), jobIndexKey(job)) {
@@ -2677,12 +2741,23 @@ func (s *Store) CancelJob(id string) (Job, error) {
 // A foreign owner is indistinguishable from a missing ID; an empty owner keeps
 // the trusted aggregate-operator behavior used by internal callers.
 func (s *Store) CancelJobOwned(id, owner string) (Job, error) {
+	return s.CancelJobForProducer(id, owner, nil)
+}
+
+// CancelJobForProducer repeats the producer subject+tenant authorization in
+// the same write transaction as the state transition. The relay performs a
+// visibility check first for response handling, but this atomic check prevents
+// any future caller from accidentally turning that check into a TOCTOU gap.
+func (s *Store) CancelJobForProducer(id, owner string, allowedTenants []string) (Job, error) {
 	var job Job
 	err := s.db.Update(func(tx *bolt.Tx) error {
+		if owner != "" && !executionScopeLookupMatches(tx.Bucket(bucketJobOwnerLookup), id, owner, allowedTenants) {
+			return os.ErrNotExist
+		}
 		if err := getJSON(tx.Bucket(bucketJobs), id, &job); err != nil {
 			return err
 		}
-		if owner != "" && job.OwnerSubject != owner {
+		if owner != "" && (job.OwnerSubject != owner || !tenantAllowed(job.TenantID, allowedTenants)) {
 			return os.ErrNotExist
 		}
 		if job.Status == JobCompleted || job.Status == JobFailed || job.Status == JobCancelled {
@@ -3682,6 +3757,17 @@ func (s *Store) ListJobSummaryPage(limit int, afterKey []byte, status, owner, te
 			if len(prefix) > 0 && !bytes.HasPrefix(key, prefix) {
 				break
 			}
+			scanned++
+			lastScanned = append(lastScanned[:0], key...)
+			// A producer-scoped page already has an exact owner prefix. Apply
+			// credential tenant authority through the fixed-size lookup before
+			// parsing the authoritative JSON so a same-subject foreign tenant
+			// cannot impose large request/result decoding work.
+			if owner != "" && len(allowedTenants) > 0 &&
+				!executionScopeLookupMatches(tx.Bucket(bucketJobOwnerLookup), string(id), owner, allowedTenants) {
+				key, id = cursor.Prev()
+				continue
+			}
 			raw := tx.Bucket(bucketJobs).Get(id)
 			if raw == nil {
 				return os.ErrNotExist
@@ -3694,8 +3780,6 @@ func (s *Store) ListJobSummaryPage(limit int, afterKey []byte, status, owner, te
 			if owner != "" && (job.OwnerSubject != owner || !bytes.Equal(key, jobOwnerIndexKey(job))) {
 				return errors.New("job owner index does not match its authoritative record")
 			}
-			scanned++
-			lastScanned = append(lastScanned[:0], key...)
 			if (status == "" || job.Status == status) &&
 				(tenant == "" || job.TenantID == tenant) &&
 				(len(allowedSubjects) == 0 || contains(allowedSubjects, job.OwnerSubject)) &&
@@ -4092,7 +4176,7 @@ func (s *Store) SavePipelineRun(run PipelineRun) error {
 		if err := putJSON(bucket, run.ID, run); err != nil {
 			return err
 		}
-		if err := putOwnerLookup(tx.Bucket(bucketPipelineOwnerLookup), run.ID, run.OwnerSubject); err != nil {
+		if err := putExecutionScopeLookup(tx.Bucket(bucketPipelineOwnerLookup), run.ID, run.OwnerSubject, run.TenantID); err != nil {
 			return err
 		}
 		if !existed && run.Status == "running" {
@@ -4145,7 +4229,7 @@ func (s *Store) CreatePipelineRunAdmitted(run PipelineRun, maxGlobal, maxOwner i
 		if err := putJSON(bucket, run.ID, run); err != nil {
 			return err
 		}
-		if err := putOwnerLookup(tx.Bucket(bucketPipelineOwnerLookup), run.ID, run.OwnerSubject); err != nil {
+		if err := putExecutionScopeLookup(tx.Bucket(bucketPipelineOwnerLookup), run.ID, run.OwnerSubject, run.TenantID); err != nil {
 			return err
 		}
 		return appendPipelineEventTx(tx, s, run, "pipeline.started")
@@ -4288,12 +4372,24 @@ func (s *Store) GetPipelineRun(id string) (PipelineRun, error) {
 // producer boundary is checked without decoding another producer's input or
 // graph state.
 func (s *Store) GetPipelineRunForOwner(id, owner string) (PipelineRun, error) {
+	return s.GetPipelineRunForProducer(id, owner, nil)
+}
+
+// GetPipelineRunForProducer is the tenant-aware pipeline equivalent of
+// GetJobForProducer.
+func (s *Store) GetPipelineRunForProducer(id, owner string, allowedTenants []string) (PipelineRun, error) {
 	var run PipelineRun
 	err := s.db.View(func(tx *bolt.Tx) error {
-		if !ownerLookupMatches(tx.Bucket(bucketPipelineOwnerLookup), id, owner) {
+		if !executionScopeLookupMatches(tx.Bucket(bucketPipelineOwnerLookup), id, owner, allowedTenants) {
 			return os.ErrNotExist
 		}
-		return getJSON(tx.Bucket(bucketPipelineRuns), id, &run)
+		if err := getJSON(tx.Bucket(bucketPipelineRuns), id, &run); err != nil {
+			return err
+		}
+		if run.OwnerSubject != owner || !tenantAllowed(run.TenantID, allowedTenants) {
+			return os.ErrNotExist
+		}
+		return nil
 	})
 	return run, err
 }
@@ -4448,26 +4544,44 @@ func deleteJobOwnerIndex(bucket *bolt.Bucket, job Job) error {
 	return nil
 }
 
-func putOwnerLookup(bucket *bolt.Bucket, id, owner string) error {
+func putExecutionScopeLookup(bucket *bolt.Bucket, id, owner, tenant string) error {
 	if bucket == nil || id == "" {
-		return errors.New("execution owner lookup is unavailable")
+		return errors.New("execution scope lookup is unavailable")
 	}
-	digest := sha256.Sum256([]byte(owner))
-	return bucket.Put([]byte(id), digest[:])
+	ownerDigest := sha256.Sum256([]byte(owner))
+	tenantDigest := sha256.Sum256([]byte(tenant))
+	value := make([]byte, 0, 2*sha256.Size)
+	value = append(value, ownerDigest[:]...)
+	value = append(value, tenantDigest[:]...)
+	return bucket.Put([]byte(id), value)
 }
 
-func ownerLookupMatches(bucket *bolt.Bucket, id, owner string) bool {
-	expected := sha256.Sum256([]byte(owner))
-	var actual [sha256.Size]byte
+func executionScopeLookupMatches(bucket *bolt.Bucket, id, owner string, allowedTenants []string) bool {
+	expectedOwner := sha256.Sum256([]byte(owner))
+	var actualOwner, actualTenant [sha256.Size]byte
 	raw := []byte(nil)
 	if bucket != nil {
 		raw = bucket.Get([]byte(id))
 	}
-	if len(raw) == sha256.Size {
-		copy(actual[:], raw)
+	if len(raw) == 2*sha256.Size {
+		copy(actualOwner[:], raw[:sha256.Size])
+		copy(actualTenant[:], raw[sha256.Size:])
 	}
-	matched := subtle.ConstantTimeCompare(expected[:], actual[:]) == 1
-	return len(raw) == sha256.Size && matched
+	ownerMatches := subtle.ConstantTimeCompare(expectedOwner[:], actualOwner[:])
+	tenantMatches := 0
+	if len(allowedTenants) == 0 {
+		tenantMatches = 1
+	} else {
+		for _, tenant := range allowedTenants {
+			expectedTenant := sha256.Sum256([]byte(tenant))
+			tenantMatches |= subtle.ConstantTimeCompare(expectedTenant[:], actualTenant[:])
+		}
+	}
+	return len(raw) == 2*sha256.Size && ownerMatches == 1 && tenantMatches == 1
+}
+
+func tenantAllowed(tenant string, allowedTenants []string) bool {
+	return len(allowedTenants) == 0 || contains(allowedTenants, tenant)
 }
 
 func prefixUpperBound(prefix []byte) []byte {
@@ -4530,7 +4644,7 @@ func ensureExecutionOwnerLookups(tx *bolt.Tx) error {
 		if job.ID != string(key) {
 			return fmt.Errorf("migrate job owner lookup: record key %q does not match id %q", key, job.ID)
 		}
-		return putOwnerLookup(jobOwners, job.ID, job.OwnerSubject)
+		return putExecutionScopeLookup(jobOwners, job.ID, job.OwnerSubject, job.TenantID)
 	}); err != nil {
 		return err
 	}
@@ -4543,7 +4657,7 @@ func ensureExecutionOwnerLookups(tx *bolt.Tx) error {
 		if run.ID != string(key) {
 			return fmt.Errorf("migrate pipeline owner lookup: record key %q does not match id %q", key, run.ID)
 		}
-		return putOwnerLookup(pipelineOwners, run.ID, run.OwnerSubject)
+		return putExecutionScopeLookup(pipelineOwners, run.ID, run.OwnerSubject, run.TenantID)
 	}); err != nil {
 		return err
 	}
