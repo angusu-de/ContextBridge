@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Added exact adapter-profile execution classifications. Operators can review
+  one out-of-tree adapter profile as local without treating every generic
+  adapter as local; unlisted profiles retain the provider default and
+  `local_only` jobs continue to fail closed. Workers independently require the
+  same exact local classification before crossing the process boundary.
+- Added `contextbridge adapter setup` for explicit, idempotent registration of
+  one out-of-tree local adapter profile, route, and least-privilege principal.
+  Missing credentials are created only with `--create-token`, existing secrets
+  are never displayed or rotated, and one unavailable adapter cannot disable
+  unrelated routes.
+- Added a bounded typed `speech_to_text` input contract for one complete
+  Ogg/Opus recording. The core verifies base64, Ogg checksums and sequence,
+  Opus headers, terminal duration and authenticated cluster routing evidence;
+  remote audio URLs are not accepted and producer-visible responses redact the
+  embedded bytes.
 - Enforced credential-bound producer tenant scopes on existing job and
   pipeline reads, event streams, route/runtime details, legacy history, and
   cancellation. Fixed-size owner+tenant digests reject same-subject foreign

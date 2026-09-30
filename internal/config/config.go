@@ -561,7 +561,7 @@ func (c Config) Validate() error {
 				return fmt.Errorf("route %s references unsupported provider %s", name, provider)
 			}
 		}
-		if route.Task != "" && route.Task != "moderation" && route.Task != "generation" && route.Task != "extraction" && route.Task != "embedding" && route.Task != "rag_ingest" && route.Task != "rag_query" {
+		if route.Task != "" && route.Task != "moderation" && route.Task != "generation" && route.Task != "extraction" && route.Task != "embedding" && route.Task != "rag_ingest" && route.Task != "rag_query" && route.Task != "speech_to_text" {
 			return fmt.Errorf("route %s has unsupported task %s", name, route.Task)
 		}
 		if route.TimeoutSeconds < 0 || route.TimeoutSeconds > 86400 {
@@ -1398,7 +1398,7 @@ func applyDefaults(cfg *Config, base string) {
 		cfg.Cluster.Placement.MaxLatencyPenalty = 60
 	}
 	if len(cfg.Cluster.Policies.AllowedTasks) == 0 {
-		cfg.Cluster.Policies.AllowedTasks = []string{"moderation", "generation", "extraction", "embedding", "rag_ingest", "rag_query", "vision"}
+		cfg.Cluster.Policies.AllowedTasks = []string{"moderation", "generation", "extraction", "embedding", "rag_ingest", "rag_query", "vision", "speech_to_text"}
 	}
 	if cfg.Cluster.Policies.MaxAttempts == 0 {
 		cfg.Cluster.Policies.MaxAttempts = 3
@@ -1748,6 +1748,9 @@ cluster:
       require_tenant: false
       local_providers: [arsenal, llama_cpp, modelkit, modelkit_vision, ollama]
       remote_providers: []
+      # Out-of-tree adapters inherit the adapter provider classification unless
+      # an operator explicitly reviews one exact profile as local or remote.
+      adapter_profile_classifications: {}
       cost_bounded_providers: []
       default:
         egress: any
