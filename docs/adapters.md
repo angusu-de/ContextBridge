@@ -73,12 +73,23 @@ explicitly allowed adapter step instead of guessing a natural-language
 contract. The operator still reviews the resulting plan hash, or separately
 opts into a named agent authority.
 
+A local workspace adapter may use the same mechanism for exact, bounded
+workspace-relative file or archive requests. The syntax hint does not grant
+host-filesystem or shell authority: executable paths, owned roots, workspace
+allowlists, mutation enablement and sandbox policy remain private
+operator/adapter configuration. The default local automatic agent tier still
+permits no adapters or file operations.
+
 For an agent adapter step, Core places that exact request in `job.text`; the
-ordinary trusted prompt wrapper remains separate. Such a step must set
-`use_previous=false`, which prevents prior untrusted evidence from being
-silently concatenated into a machine request. Put research or retrieval first,
-then pass its normalized result to a later model step for synthesis. Profiles
-with an instruction contract are asked for JSON output; Core strictly validates
+ordinary trusted prompt wrapper remains separate. A static request sets
+`use_previous=false`. A later contracted adapter step may instead use the exact
+marker `contextbridge.previous-json.v1` with `use_previous=true`. In that narrow
+case Core requires the immediately preceding step to be non-adapter, validates
+its result as one strict JSON object, and submits that object without
+concatenating instructions or evidence. This supports bounded
+inspect-model-apply flows while leaving the adapter's action, workspace and
+mutation policy authoritative. Profiles with an instruction contract are asked
+for JSON output; Core strictly validates
 and compacts that evidence before the handoff.
 
 Use `contextbridge adapter list`, `details`, and `doctor` to inspect the

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Bound every agent planner and execution payload to the unique configured
+  generation route that permits its provider and adapter profile. Agent jobs
+  now fail closed before submission when no route matches or several routes
+  are ambiguous, instead of silently falling back to the default route.
+- Requested final-only Ollama generation with `think: false`, keeping internal
+  reasoning out of returned answers and restoring structured output for models
+  that otherwise place their entire short response in the `thinking` field.
+- Preserved an existing Unix configuration file's owner during atomic saves
+  and matched newly created adapter credentials to that owner. Root-run setup
+  commands can no longer replace a service-owned config/token with root-owned
+  files that the unprivileged relay cannot read.
+- Added an explicit strict-JSON handoff for bounded agents: after a non-adapter
+  step, a contracted adapter may consume the exact previous JSON object using
+  the reviewed `contextbridge.previous-json.v1` marker. This enables bounded
+  inspect-model-apply workflows without shell authority, adapter chaining, or
+  instruction/evidence concatenation.
+- Clarified the bounded-agent adapter contract so an explicitly selected local
+  profile may describe exact workspace-relative file or archive actions.
+  Arbitrary host paths, shell/executable selection, code execution, downloads,
+  deletion and promotion remain forbidden; the default Ollama-only automatic
+  tier still has no adapter or file authority.
 - Made adapter-backed bounded agents interoperable without exposing opaque
   driver configuration. An adapter profile may provide one validated,
   operator-owned `agent_instruction_contract`; only that string is shown to

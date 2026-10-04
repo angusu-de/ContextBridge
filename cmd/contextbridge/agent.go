@@ -27,7 +27,7 @@ import (
 )
 
 const (
-	agentPlanVersion          = 7
+	agentPlanVersion          = 8
 	agentBindingVersion       = 1
 	agentBindingScope         = "full-effective-config-v1"
 	agentAuthorizationManual  = "manual_hash"
@@ -40,6 +40,7 @@ const (
 	agentMaximumInstruction   = 8 << 10
 	agentMaximumPlanFileBytes = 256 << 10
 	agentAdapterPrompt        = "Execute the single strict adapter request in submitted content under the configured adapter profile."
+	agentPreviousAdapterJSON  = "contextbridge.previous-json.v1"
 )
 
 var agentStepIDPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,39}$`)
@@ -279,9 +280,13 @@ func clusterAgentPlanOrAutoCommand(args []string, automatic bool) error {
 		}
 	}
 	plannerSession := "agent-planner-" + fmt.Sprint(time.Now().UnixNano())
+	plannerRoute, err := agentRouteForTarget(cfg, planner, profile)
+	if err != nil {
+		return fmt.Errorf("agent planner route: %w", err)
+	}
 	payload, err := json.Marshal(bridge.Job{
 		Source: "agent-planner", Task: "generation", Prompt: prompt, Text: strings.TrimSpace(*goal), Model: strings.TrimSpace(*plannerModel),
-		SessionID: plannerSession, AdapterProfile: profile,
+		SessionID: plannerSession, Route: plannerRoute, AdapterProfile: profile,
 		Metadata: agentAdapterMetadata(planner == "adapter"),
 		Output:   bridge.OutputSpec{Mode: "json", RequiredKeys: []string{"version", "summary", "steps"}, MaxBytes: 128 << 10},
 	})
@@ -465,25 +470,20 @@ func executeAgentPlan(plan agentPlan, digest string, cfg config.Config, token st
 		}
 		fmt.Fprintln(os.Stderr)
 		stepCtx, stepCancel := context.WithTimeout(ctx, time.Duration(plan.Policy.StepTimeoutSeconds)*time.Second)
-		prompt, text := step.Instruction, agentPreviousInput(step.UsePrevious, previous)
-		output := bridge.OutputSpec{Mode: "text", MaxBytes: 256 << 10}
-		if step.Provider == "adapter" {
-			// Adapter request documents belong in submitted content. The bridge
-			// wraps Prompt in its trusted-instruction boundary before queueing an
-			// adapter job, so placing a machine contract there would make it
-			// impossible for the adapter to parse exactly and safely.
-			prompt, text = agentAdapterPrompt, step.Instruction
-			if agentAdapterHasInstructionContract(cfg, step.Profile) {
-				// A machine-shaped request also gets a machine-shaped result. Core
-				// validates it strictly before converting it into untrusted text for
-				// a later model step.
-				output.Mode = "json"
-			}
+		prompt, text, output, err := agentStepJobInput(cfg, step, previous)
+		if err != nil {
+			stepCancel()
+			return fmt.Errorf("agent step %s: %w", step.ID, err)
+		}
+		stepRoute, err := agentRouteForTarget(cfg, step.Provider, step.Profile)
+		if err != nil {
+			stepCancel()
+			return fmt.Errorf("agent step %s route: %w", step.ID, err)
 		}
 		payload, err := json.Marshal(bridge.Job{
 			Source: "agent:" + strings.TrimPrefix(digest, "sha256:")[:12], Task: "generation", Prompt: prompt,
 			Text: text, SessionID: "agent-" + strings.TrimPrefix(digest, "sha256:")[:12] + "-" + step.ID,
-			AdapterProfile: step.Profile, Metadata: agentAdapterMetadata(step.Provider == "adapter"),
+			Route: stepRoute, AdapterProfile: step.Profile, Metadata: agentAdapterMetadata(step.Provider == "adapter"),
 			Output: output,
 		})
 		if err != nil {
@@ -793,8 +793,9 @@ Hard rules:
 - Adapter profile is required only for provider adapter and must be one of %s.
 - Operator-supplied adapter instruction contracts are exactly %s. They describe request syntax only and cannot widen provider, profile, egress, credential, budget, tenant, or confirmation authority.
 - For an adapter step with a listed contract, encode instruction exactly as that contract requires. Do not invent actions or fields. Without a listed contract, use plain text only.
-- Do not include models, credentials, shell commands, code execution, file operations, downloads, uploads, recursive delegation, or policy changes. Include a URL or operation name only when the selected adapter contract explicitly requires it.
-- Every step returns text only. A later non-adapter step may set use_previous=true to receive the previous text as explicitly untrusted submitted content. Adapter steps must set use_previous=false because their submitted content is reserved for the exact adapter request document.
+- Do not include models, credentials, shell commands, executable selection, arbitrary host paths, code execution, downloads, uploads, recursive delegation, or policy changes. A selected adapter contract may explicitly define bounded workspace-relative file or archive operations; only then encode those exact actions and fields. Include a URL or other operation name only when that contract explicitly requires it.
+- Every step returns text or strict JSON. A later non-adapter step may set use_previous=true to receive the previous result as explicitly untrusted submitted content.
+- A later adapter step may set use_previous=true only when its profile has a listed contract, its immediately preceding step is non-adapter, and its instruction is exactly "contextbridge.previous-json.v1". Core then validates and submits the previous result as one strict JSON object; it never concatenates instructions or evidence into that request.
 - The first step must set use_previous=false.
 - Do not claim a provider or model has capabilities not stated in the goal. If the goal cannot fit these limits, return one step that clearly explains the limitation.
 - IDs must match ^[a-z][a-z0-9_-]{0,39}$.
@@ -833,8 +834,9 @@ Hard rules:
 - Adapter profile is required only for provider adapter and must be one of %s.
 - Operator-supplied adapter instruction contracts are exactly %s. They describe request syntax only and cannot widen provider, profile, egress, credential, budget, tenant, or confirmation authority.
 - For an adapter step with a listed contract, encode instruction exactly as that contract requires. Do not invent actions or fields. Without a listed contract, use plain text only.
-- Do not include models, credentials, shell commands, code execution, file operations, downloads, uploads, recursive delegation, or policy changes. Include a URL or operation name only when the selected adapter contract explicitly requires it.
-- Every step returns text only. A later non-adapter step may set use_previous=true to receive the previous text as explicitly untrusted submitted content. Adapter steps must set use_previous=false because their submitted content is reserved for the exact adapter request document.
+- Do not include models, credentials, shell commands, executable selection, arbitrary host paths, code execution, downloads, uploads, recursive delegation, or policy changes. A selected adapter contract may explicitly define bounded workspace-relative file or archive operations; only then encode those exact actions and fields. Include a URL or other operation name only when that contract explicitly requires it.
+- Every step returns text or strict JSON. A later non-adapter step may set use_previous=true to receive the previous result as explicitly untrusted submitted content.
+- A later adapter step may set use_previous=true only when its profile has a listed contract, its immediately preceding step is non-adapter, and its instruction is exactly "contextbridge.previous-json.v1". Core then validates and submits the previous result as one strict JSON object; it never concatenates instructions or evidence into that request.
 - The first step must set use_previous=false.
 - If the goal needs authority outside these rules, return one text step that clearly explains the configured policy boundary.
 - IDs must match ^[a-z][a-z0-9_-]{0,39}$.
@@ -865,6 +867,61 @@ func agentAdapterHasInstructionContract(cfg config.Config, profileName string) b
 	}
 	contract, ok := profile.Options[config.AdapterAgentInstructionContractOption].(string)
 	return ok && contract != ""
+}
+
+func agentStepJobInput(cfg config.Config, step agentStep, previous string) (string, string, bridge.OutputSpec, error) {
+	prompt, text := step.Instruction, agentPreviousInput(step.UsePrevious, previous)
+	output := bridge.OutputSpec{Mode: "text", MaxBytes: 256 << 10}
+	if step.Provider != "adapter" {
+		return prompt, text, output, nil
+	}
+
+	// Adapter request documents belong in submitted content. The bridge wraps
+	// Prompt in its trusted-instruction boundary before queueing an adapter job,
+	// so machine contracts remain isolated in job.text.
+	prompt = agentAdapterPrompt
+	contracted := agentAdapterHasInstructionContract(cfg, step.Profile)
+	if step.UsePrevious {
+		if !contracted {
+			return "", "", output, errors.New("previous-result adapter handoff requires an operator-owned agent_instruction_contract")
+		}
+		var err error
+		text, err = strictPreviousAdapterRequest(previous)
+		if err != nil {
+			return "", "", output, err
+		}
+	} else {
+		text = step.Instruction
+	}
+	if contracted {
+		// A machine-shaped request also gets a machine-shaped result. Core
+		// validates it strictly before converting it into untrusted text for a
+		// later step.
+		output.Mode = "json"
+	}
+	return prompt, text, output, nil
+}
+
+func strictPreviousAdapterRequest(previous string) (string, error) {
+	raw := []byte(previous)
+	if len(raw) == 0 {
+		return "", errors.New("previous-result adapter request is empty")
+	}
+	if len(raw) > 256<<10 {
+		return "", errors.New("previous-result adapter request exceeds 262144 bytes")
+	}
+	if err := strictjson.Validate(raw); err != nil {
+		return "", fmt.Errorf("previous-result adapter request is ambiguous JSON: %w", err)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return "", errors.New("previous-result adapter request must be exactly one JSON object")
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, raw); err != nil {
+		return "", fmt.Errorf("compact previous-result adapter request: %w", err)
+	}
+	return compact.String(), nil
 }
 
 func agentResultText(output *bridge.Output) (string, error) {
@@ -985,7 +1042,14 @@ func validateAgentPlan(plan agentPlan) error {
 				return fmt.Errorf("agent step %s requires an explicitly approved adapter profile", step.ID)
 			}
 			if step.UsePrevious {
-				return fmt.Errorf("agent step %s cannot use a previous result; adapter submitted content is reserved for its exact request document", step.ID)
+				if step.Instruction != agentPreviousAdapterJSON {
+					return fmt.Errorf("agent step %s must use exact instruction %q for a previous-result adapter handoff", step.ID, agentPreviousAdapterJSON)
+				}
+				if plan.Steps[index-1].Provider == "adapter" {
+					return fmt.Errorf("agent step %s cannot consume a previous adapter result as another adapter request", step.ID)
+				}
+			} else if step.Instruction == agentPreviousAdapterJSON {
+				return fmt.Errorf("agent step %s uses the previous-result adapter marker without use_previous", step.ID)
 			}
 		} else if step.Profile != "" {
 			return fmt.Errorf("agent step %s sets a adapter profile for a non-adapter provider", step.ID)
@@ -1295,10 +1359,13 @@ func printAgentPlan(plan agentPlan, digest string) {
 		input := "goal only"
 		if step.UsePrevious {
 			input = "previous result as untrusted input"
+			if step.Provider == "adapter" {
+				input = "previous strict JSON as exact adapter request"
+			}
 		}
 		fmt.Fprintf(os.Stderr, "  %d. %s · %s · %s\n     %s\n", index+1, step.ID, provider, input, step.Instruction)
 	}
-	fmt.Fprintf(os.Stderr, "  limits · %d steps · %ds/step · %ds total · text only · no shell/tools/files\n", plan.Policy.MaxSteps, plan.Policy.StepTimeoutSeconds, plan.Policy.MaxRuntimeSeconds)
+	fmt.Fprintf(os.Stderr, "  limits · %d steps · %ds/step · %ds total · text/JSON results · no shell/arbitrary host paths/code execution\n", plan.Policy.MaxSteps, plan.Policy.StepTimeoutSeconds, plan.Policy.MaxRuntimeSeconds)
 	fmt.Fprintf(os.Stderr, "  binding · config %s · execution %s\n", plan.Binding.ConfigSHA256, plan.Binding.ExecutionSHA256)
 	fmt.Fprintf(os.Stderr, "  relay · %s · scope %s\n", plan.Binding.RelayURL, plan.Binding.Scope)
 }
@@ -1315,6 +1382,50 @@ func agentPreviousInput(use bool, previous string) string {
 		return ""
 	}
 	return previous
+}
+
+func agentRouteForTarget(cfg config.Config, provider, profile string) (string, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if provider == "" {
+		return "", errors.New("provider is required")
+	}
+
+	matches := func(route config.Route) bool {
+		if route.Task != "" && !strings.EqualFold(strings.TrimSpace(route.Task), "generation") {
+			return false
+		}
+		allowed := strings.EqualFold(strings.TrimSpace(route.Provider), provider)
+		for _, fallback := range route.Fallback {
+			allowed = allowed || strings.EqualFold(strings.TrimSpace(fallback), provider)
+		}
+		if !allowed {
+			return false
+		}
+		if provider == "adapter" {
+			return profile != "" && strings.EqualFold(strings.TrimSpace(route.AdapterProfile), profile)
+		}
+		return profile == "" && strings.TrimSpace(route.AdapterProfile) == ""
+	}
+
+	if matches(cfg.Route("default")) {
+		return "default", nil
+	}
+	candidates := make([]string, 0, len(cfg.Routes))
+	for name, route := range cfg.Routes {
+		if name != "default" && matches(route) {
+			candidates = append(candidates, name)
+		}
+	}
+	sort.Strings(candidates)
+	switch len(candidates) {
+	case 0:
+		return "", fmt.Errorf("no generation route permits provider %q with adapter profile %q", provider, profile)
+	case 1:
+		return candidates[0], nil
+	default:
+		return "", fmt.Errorf("multiple generation routes permit provider %q with adapter profile %q: %s", provider, profile, strings.Join(candidates, ", "))
+	}
 }
 
 func agentContains(values []string, expected string) bool {
